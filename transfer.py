@@ -95,10 +95,12 @@ class YandexDiskClient:
     
     def _extract_public_key(self) -> str:
         """Extract public key from Yandex Disk URL."""
-        # Extract the key from URL like https://disk.yandex.ru/d/Y1yHasRikR9qBQ
+        # Try using the full URL first, fall back to just the key
+        # The API accepts both formats
         parsed = urlparse(self.public_key)
         if parsed.path.startswith('/d/'):
-            return parsed.path[3:]  # Remove '/d/'
+            # Return the full URL as public_key (API accepts this)
+            return self.public_key
         return self.public_key
     
     def _make_request(self, method: str, url: str, **kwargs):
@@ -129,26 +131,63 @@ class YandexDiskClient:
         """
         public_key = self._extract_public_key()
         url = f'{self.base_url}/public/resources'
-        params = {'public_key': public_key}
+        
+        # Try with full URL first, then try with just the key
+        params_list = [
+            {'public_key': public_key},  # Full URL
+            {'public_key': urlparse(public_key).path[3:] if urlparse(public_key).path.startswith('/d/') else public_key}  # Just the key
+        ]
+        
         headers = self._get_headers()
         
-        try:
-            response = self._make_request('get', url, params=params, headers=headers, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            files = []
-            if '_embedded' in data and 'items' in data['_embedded']:
-                for item in data['_embedded']['items']:
-                    if item.get('type') == 'file':
-                        files.append(item)
-            
-            logger.info(f"Found {len(files)} files in Yandex Disk folder")
-            return files
-            
-        except (self.requests.exceptions.RequestException, YaDiskError) as e:
-            logger.error(f"Error listing files from Yandex Disk: {e}")
-            raise
+        last_error = None
+        for params in params_list:
+            try:
+                logger.debug(f"Trying to list files with params: {params}")
+                response = self._make_request('get', url, params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                files = []
+                if '_embedded' in data and 'items' in data['_embedded']:
+                    for item in data['_embedded']['items']:
+                        if item.get('type') == 'file':
+                            files.append(item)
+                
+                logger.info(f"Found {len(files)} files in Yandex Disk folder")
+                return files
+                
+            except self.requests.exceptions.HTTPError as e:
+                last_error = e
+                if e.response.status_code == 404:
+                    # Try next format if this was the first attempt
+                    if params == params_list[0]:
+                        logger.debug(f"404 with first format, trying alternative format...")
+                        continue
+                    else:
+                        # Both formats failed
+                        logger.error(f"404 error - Public folder not found or not accessible.")
+                        logger.error(f"URL tried: {url}")
+                        logger.error(f"Public key formats tried: {[p.get('public_key') for p in params_list]}")
+                        logger.error(f"Response: {e.response.text if hasattr(e.response, 'text') else 'No response text'}")
+                        raise Exception(f"Public folder not accessible. Ensure the folder is public and the URL is correct. You may need an OAuth token.")
+                else:
+                    logger.error(f"HTTP error listing files from Yandex Disk: {e}")
+                    logger.error(f"Response: {e.response.text if hasattr(e.response, 'text') else 'No response text'}")
+                    raise
+            except (self.requests.exceptions.RequestException, YaDiskError) as e:
+                last_error = e
+                logger.error(f"Error listing files from Yandex Disk: {e}")
+                if params == params_list[0]:
+                    logger.debug(f"Trying alternative format...")
+                    continue
+                else:
+                    raise
+        
+        # If we get here, both formats failed
+        if last_error:
+            raise Exception(f"Failed to access public folder. Last error: {last_error}")
+        raise Exception("Failed to access public folder with both URL and key formats")
     
     def get_download_link(self, file_path: str) -> str:
         """
@@ -162,21 +201,42 @@ class YandexDiskClient:
         """
         public_key = self._extract_public_key()
         url = f'{self.base_url}/public/resources/download'
-        params = {
-            'public_key': public_key,
-            'path': file_path
-        }
+        
+        # Try with full URL first, then try with just the key
+        public_key_value = public_key
+        parsed = urlparse(public_key)
+        if parsed.path.startswith('/d/'):
+            public_key_value = parsed.path[3:]  # Extract just the key
+        
+        params_list = [
+            {'public_key': public_key, 'path': file_path},  # Full URL
+            {'public_key': public_key_value, 'path': file_path}  # Just the key
+        ]
+        
         headers = self._get_headers()
         
-        try:
-            response = self._make_request('get', url, params=params, headers=headers, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            return data['href']
-            
-        except (self.requests.exceptions.RequestException, YaDiskError) as e:
-            logger.error(f"Error getting download link for {file_path}: {e}")
-            raise
+        for params in params_list:
+            try:
+                logger.debug(f"Trying to get download link with params: {params}")
+                response = self._make_request('get', url, params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                return data['href']
+                
+            except self.requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404 and params == params_list[0]:
+                    # Try next format
+                    logger.debug(f"404 with full URL, trying key only format...")
+                    continue
+                else:
+                    logger.error(f"Error getting download link for {file_path}: {e}")
+                    raise
+            except (self.requests.exceptions.RequestException, YaDiskError) as e:
+                logger.error(f"Error getting download link for {file_path}: {e}")
+                raise
+        
+        # If we get here, both formats failed
+        raise Exception(f"Failed to get download link for {file_path} with both URL and key formats")
     
     def download_file(self, download_url: str, local_path: str) -> bool:
         """
