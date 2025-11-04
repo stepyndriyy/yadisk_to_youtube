@@ -217,18 +217,26 @@ class YouTubeUploader:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     self.client_secrets_file, SCOPES)
                 
-                # Try browser-based auth first, fall back to console if browser unavailable
+                # Try browser-based auth first, fall back to manual console if browser unavailable
                 try:
                     logger.info("Attempting browser-based authentication...")
                     creds = flow.run_local_server(port=0)
                 except Exception as e:
                     logger.warning(f"Browser authentication failed: {e}")
-                    logger.info("Falling back to console-based authentication...")
+                    logger.info("Falling back to manual console-based authentication...")
                     logger.info("=" * 60)
                     logger.info("Please visit the following URL to authorize this application:")
                     logger.info("")
-                    creds = flow.run_console()
+                    authorization_url, _ = flow.authorization_url(prompt='consent')
+                    logger.info(authorization_url)
+                    logger.info("")
+                    logger.info("After authorizing, you will be redirected. Copy the 'code' parameter")
+                    logger.info("from the URL and paste it below.")
                     logger.info("=" * 60)
+                    authorization_code = input("Enter the authorization code: ").strip()
+                    flow.fetch_token(code=authorization_code)
+                    creds = flow.credentials
+                    logger.info("Successfully obtained credentials!")
             
             # Save credentials for next run
             with open(YOUTUBE_TOKEN_FILE, 'w') as token:
