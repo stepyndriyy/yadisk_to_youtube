@@ -16,7 +16,7 @@ from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
 import yadisk
-import yadisk.exceptions
+from yadisk.exceptions import YandexDiskError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -146,7 +146,7 @@ class YandexDiskClient:
             logger.info(f"Found {len(files)} files in Yandex Disk folder")
             return files
             
-        except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
+        except (self.requests.exceptions.RequestException, YandexDiskError) as e:
             logger.error(f"Error listing files from Yandex Disk: {e}")
             raise
     
@@ -174,7 +174,7 @@ class YandexDiskClient:
             data = response.json()
             return data['href']
             
-        except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
+        except (self.requests.exceptions.RequestException, YandexDiskError) as e:
             logger.error(f"Error getting download link for {file_path}: {e}")
             raise
     
@@ -222,7 +222,7 @@ class YandexDiskClient:
                 logger.info(f"Successfully downloaded {local_path} ({downloaded / (1024*1024):.1f} MB)")
                 return True
                 
-            except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
+            except (self.requests.exceptions.RequestException, YandexDiskError) as e:
                 logger.warning(f"Download attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay * (attempt + 1))
