@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
-import requests
+import yadisk
+import yadisk.exceptions
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -52,12 +53,38 @@ UPLOADED_VIDEOS_LOG = 'uploaded_videos.json'
 
 
 class YandexDiskClient:
-    """Client for accessing Yandex Disk files."""
+    """Client for accessing Yandex Disk files using yadisk library."""
     
     def __init__(self, public_key: str, oauth_token: Optional[str] = None):
         self.public_key = public_key
         self.oauth_token = oauth_token
         self.base_url = 'https://cloud-api.yandex.net/v1/disk'
+        
+        # Initialize yadisk client if token is provided, otherwise use requests session
+        self.client = None
+        self.session = None
+        
+        if self.oauth_token:
+            try:
+                self.client = yadisk.Client(token=self.oauth_token)
+                # Access the underlying session for public folder API calls
+                # yadisk uses requests.Session internally, try to access it
+                if hasattr(self.client, '_session'):
+                    self.session = self.client._session
+                elif hasattr(self.client, 'session'):
+                    self.session = self.client.session
+                else:
+                    # Try to get session from the client's HTTP adapter
+                    self.session = None
+                logger.info("Initialized Yandex Disk client with OAuth token")
+            except Exception as e:
+                logger.warning(f"Failed to initialize yadisk client: {e}. Will use direct API calls.")
+                self.client = None
+                self.session = None
+        
+        # Import requests for fallback/direct API calls
+        import requests
+        self.requests = requests
         
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
@@ -74,6 +101,27 @@ class YandexDiskClient:
             return parsed.path[3:]  # Remove '/d/'
         return self.public_key
     
+    def _make_request(self, method: str, url: str, **kwargs):
+        """
+        Make HTTP request using yadisk session if available, otherwise use requests.
+        
+        Args:
+            method: HTTP method (get, post, etc.)
+            url: Request URL
+            **kwargs: Additional arguments for the request
+            
+        Returns:
+            Response object
+        """
+        if self.session:
+            # Use yadisk's session if available
+            func = getattr(self.session, method.lower())
+            return func(url, **kwargs)
+        else:
+            # Fallback to requests
+            func = getattr(self.requests, method.lower())
+            return func(url, **kwargs)
+    
     def list_files(self) -> List[Dict]:
         """
         List all files in the public folder.
@@ -85,7 +133,7 @@ class YandexDiskClient:
         headers = self._get_headers()
         
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response = self._make_request('get', url, params=params, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
             
@@ -98,7 +146,7 @@ class YandexDiskClient:
             logger.info(f"Found {len(files)} files in Yandex Disk folder")
             return files
             
-        except requests.exceptions.RequestException as e:
+        except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
             logger.error(f"Error listing files from Yandex Disk: {e}")
             raise
     
@@ -121,12 +169,12 @@ class YandexDiskClient:
         headers = self._get_headers()
         
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response = self._make_request('get', url, params=params, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
             return data['href']
             
-        except requests.exceptions.RequestException as e:
+        except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
             logger.error(f"Error getting download link for {file_path}: {e}")
             raise
     
@@ -148,7 +196,12 @@ class YandexDiskClient:
             try:
                 logger.info(f"Downloading to {local_path} (attempt {attempt + 1}/{max_retries})...")
                 
-                response = requests.get(download_url, stream=True, timeout=300)
+                # Use session if available, otherwise use requests directly
+                if self.session:
+                    response = self.session.get(download_url, stream=True, timeout=300)
+                else:
+                    response = self.requests.get(download_url, stream=True, timeout=300)
+                
                 response.raise_for_status()
                 
                 total_size = int(response.headers.get('content-length', 0))
@@ -169,7 +222,7 @@ class YandexDiskClient:
                 logger.info(f"Successfully downloaded {local_path} ({downloaded / (1024*1024):.1f} MB)")
                 return True
                 
-            except requests.exceptions.RequestException as e:
+            except (self.requests.exceptions.RequestException, yadisk.exceptions.YaDiskException) as e:
                 logger.warning(f"Download attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay * (attempt + 1))
@@ -178,6 +231,14 @@ class YandexDiskClient:
                     return False
         
         return False
+    
+    def close(self):
+        """Close the yadisk client if it was initialized."""
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
 
 
 class YouTubeUploader:
@@ -402,89 +463,97 @@ def main():
     logger.info("Starting Yandex Disk to YouTube transfer")
     
     # Initialize clients
+    yandex_client = None
     try:
         yandex_client = YandexDiskClient(YANDEX_DISK_PUBLIC_KEY, YANDEX_OAUTH_TOKEN)
         youtube_uploader = YouTubeUploader(YOUTUBE_CLIENT_SECRETS_FILE)
     except Exception as e:
         logger.error(f"Failed to initialize clients: {e}")
+        if yandex_client:
+            yandex_client.close()
         sys.exit(1)
     
-    # Load already uploaded videos
-    uploaded_files = load_uploaded_videos()
-    logger.info(f"Found {len(uploaded_files)} already uploaded videos")
-    
-    # List files from Yandex Disk
     try:
-        files = yandex_client.list_files()
-    except Exception as e:
-        logger.error(f"Failed to list files from Yandex Disk: {e}")
-        sys.exit(1)
-    
-    # Filter .mov files
-    mov_files = [f for f in files if f['name'].lower().endswith('.mov')]
-    logger.info(f"Found {len(mov_files)} .mov files to process")
-    
-    if not mov_files:
-        logger.info("No .mov files found. Exiting.")
-        return
-    
-    # Process each video
-    successful_uploads = 0
-    failed_uploads = 0
-    
-    for file_info in mov_files:
-        filename = file_info['name']
-        file_path = file_info['path']
+        # Load already uploaded videos
+        uploaded_files = load_uploaded_videos()
+        logger.info(f"Found {len(uploaded_files)} already uploaded videos")
         
-        # Skip if already uploaded
-        if filename in uploaded_files:
-            logger.info(f"Skipping {filename} (already uploaded)")
-            continue
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing: {filename}")
-        logger.info(f"{'='*60}")
-        
-        # Get download link
+        # List files from Yandex Disk
         try:
-            download_url = yandex_client.get_download_link(file_path)
+            files = yandex_client.list_files()
         except Exception as e:
-            logger.error(f"Failed to get download link for {filename}: {e}")
-            failed_uploads += 1
-            continue
+            logger.error(f"Failed to list files from Yandex Disk: {e}")
+            return
         
-        # Download file
-        local_path = os.path.join(os.getcwd(), filename)
-        if not yandex_client.download_file(download_url, local_path):
-            logger.error(f"Failed to download {filename}")
-            failed_uploads += 1
-            continue
+        # Filter .mov files
+        mov_files = [f for f in files if f['name'].lower().endswith('.mov')]
+        logger.info(f"Found {len(mov_files)} .mov files to process")
         
-        # Upload to YouTube
-        video_id = youtube_uploader.upload_video(local_path, title=Path(filename).stem)
+        if not mov_files:
+            logger.info("No .mov files found. Exiting.")
+            return
         
-        if video_id:
-            # Save upload record
-            save_uploaded_video(filename, video_id)
-            successful_uploads += 1
+        # Process each video
+        successful_uploads = 0
+        failed_uploads = 0
+        
+        for file_info in mov_files:
+            filename = file_info['name']
+            file_path = file_info['path']
             
-            # Delete local file
+            # Skip if already uploaded
+            if filename in uploaded_files:
+                logger.info(f"Skipping {filename} (already uploaded)")
+                continue
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing: {filename}")
+            logger.info(f"{'='*60}")
+            
+            # Get download link
             try:
-                os.remove(local_path)
-                logger.info(f"Deleted local file: {local_path}")
+                download_url = yandex_client.get_download_link(file_path)
             except Exception as e:
-                logger.warning(f"Could not delete local file {local_path}: {e}")
-        else:
-            logger.error(f"Failed to upload {filename} to YouTube")
-            failed_uploads += 1
-            # Keep the file for manual retry
-    
-    # Summary
-    logger.info(f"\n{'='*60}")
-    logger.info("Transfer complete!")
-    logger.info(f"Successful uploads: {successful_uploads}")
-    logger.info(f"Failed uploads: {failed_uploads}")
-    logger.info(f"{'='*60}")
+                logger.error(f"Failed to get download link for {filename}: {e}")
+                failed_uploads += 1
+                continue
+            
+            # Download file
+            local_path = os.path.join(os.getcwd(), filename)
+            if not yandex_client.download_file(download_url, local_path):
+                logger.error(f"Failed to download {filename}")
+                failed_uploads += 1
+                continue
+            
+            # Upload to YouTube
+            video_id = youtube_uploader.upload_video(local_path, title=Path(filename).stem)
+            
+            if video_id:
+                # Save upload record
+                save_uploaded_video(filename, video_id)
+                successful_uploads += 1
+                
+                # Delete local file
+                try:
+                    os.remove(local_path)
+                    logger.info(f"Deleted local file: {local_path}")
+                except Exception as e:
+                    logger.warning(f"Could not delete local file {local_path}: {e}")
+            else:
+                logger.error(f"Failed to upload {filename} to YouTube")
+                failed_uploads += 1
+                # Keep the file for manual retry
+        
+        # Summary
+        logger.info(f"\n{'='*60}")
+        logger.info("Transfer complete!")
+        logger.info(f"Successful uploads: {successful_uploads}")
+        logger.info(f"Failed uploads: {failed_uploads}")
+        logger.info(f"{'='*60}")
+    finally:
+        # Clean up Yandex Disk client
+        if yandex_client:
+            yandex_client.close()
 
 
 if __name__ == '__main__':
